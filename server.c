@@ -3,23 +3,13 @@
 #include "common_lib.h"
 
 packet_t packet, recvPacket;
-static void timeoutSigalarmHandler( int sig );
-//debug utility function
-void packetSent()
-{
-  printf( "packet sent: msgSize = %d, seq = %d\n", packet.msgSize, packet.seq );
-}
-void ackRecv()
-{
-  printf( "ack received: msgSize = %d, ack = %d\n", recvPacket.msgSize, recvPacket.ack );
-}
 
 int main( int argc, char** argv )
 {
   //data
   int udp_servfd, bytesRead, len, filefd, fileSize, seq, ack, timeoutSecond = INITTIMEOUT, connectionBroke;
   struct sockaddr_in udp_servaddr, tcp_servaddr, cliaddr;
-  char fileName[FILENAMELEN+1], clientIP[INET_ADDRSTRLEN];
+  char clientIP[INET_ADDRSTRLEN];
   struct sigaction sa, oldsa;
   const int on = 1;
   fd_set rset;
@@ -41,104 +31,106 @@ int main( int argc, char** argv )
     err_sys( "sigaction" );
 
   while( 1 ){
+NEW_CONNECTION:
     printf( "waiting for connection...\n" );
     len = sizeof(cliaddr);
     //receiving a null terminated filename
-    recvfrom( udp_servfd, fileName, sizeof(fileName), 0, (SA*)&cliaddr, &len  );
-    Inet_ntop(AF_INET, &cliaddr.sin_addr, clientIP, sizeof(clientIP));
-    printf( "server reads request for '%s' from %s:%d\n", fileName, clientIP, ntohs(cliaddr.sin_port) );
-    if( (filefd = open( fileName, O_RDONLY )) < 0 ){
-      //file open error
-      switch( errno ){
-        case EACCES: snprintf( packet.msg, sizeof(packet.msg), "Access denied: %s\n", fileName ); break;
-        case ENOENT: snprintf( packet.msg, sizeof(packet.msg), "No such file or directory: %s\n", fileName ); break;
-        default: snprintf( packet.msg, sizeof(packet.msg), "Server open failed\n" ); break;
-      }
-      printf( "open error: %s", packet.msg );
-      makePacket( &packet, strlen(packet.msg), ERR, 0, 0, NULL );
-      Sendto( udp_servfd, &packet, packet.msgSize + PACKET_OVERHEAD, 0, (const SA*)&cliaddr, len );
+    recvfrom( udp_servfd, &recvPacket, sizeof(recvPacket), 0, (SA*)&cliaddr, &len  );
+    if( recvPacket.type != REQ ) {
+      printf( "unrecognized packet received\n" );
+      goto NEW_CONNECTION;
     } else {
-      //find out file size (just an extra reliable guarantee)
-      fileSize = lseek( filefd, -1, SEEK_END )+1;
-      printf( "reading %s, size %d bytes\n", fileName, fileSize );
-      lseek( filefd, 0, SEEK_SET );
-      //initiating first packet
-      connectionBroke = 0;
-      seq = ack = 0;
-      bytesRead = Readn( filefd, packet.msg, min( PMTU, fileSize ) );
-      while( (fileSize>0) && (connectionBroke==0) ) {
-        makePacket( &packet, bytesRead, SYN, seq, 0, NULL );
-        //start timer
-        alarm(timeoutSecond);
-        Sendto( udp_servfd, &packet, packet.msgSize + PACKET_OVERHEAD, 0, (const SA*)&cliaddr, len );
-        packetSent();
+      Inet_ntop(AF_INET, &cliaddr.sin_addr, clientIP, sizeof(clientIP));
+      printf( "server reads request for '%s' from %s:%d\n", recvPacket.msg, clientIP, ntohs(cliaddr.sin_port) );
 
-        //timed recvfrom
-        while( recvfrom( udp_servfd, &recvPacket, sizeof(recvPacket), 0, (SA*)&cliaddr, &len ) < 0 ) {
-          //if timed out
-          if( errno == EINTR ) {
-            //double retransmission interval and retransmit if timeoutSecond < maxTimeout
-            if(timeoutSecond < MAXTIMEOUT) {
-              timeoutSecond <<= 1;
-              alarm(timeoutSecond);
-              Sendto( udp_servfd, &packet, packet.msgSize + PACKET_OVERHEAD, 0, (const SA*)&cliaddr, len );
-              printf( "packet retransmission, seq = %d\n", packet.seq );
-            //otherwise a broken connection is infered
-            } else {
-              //if connection timed out, send a last RST datagram then waits for other requests
-              connectionBroke = 1;
-              printf( "connection timed ouit\n" );
-              makePacket( &packet, 0, RST, 0, 0, NULL );
-            }
-          } else
-            err_sys( "recvfromTimeout" );
+      if( (filefd = open( recvPacket.msg, O_RDONLY )) < 0 ){
+        //file open error
+        switch( errno ){
+          case EACCES: snprintf( packet.msg, sizeof(packet.msg), "Access denied: %s\n", recvPacket.msg); break;
+          case ENOENT: snprintf( packet.msg, sizeof(packet.msg), "No such file or directory: %s\n", recvPacket.msg); break;
+          default: snprintf( packet.msg, sizeof(packet.msg), "Server open failed\n" ); break;
         }
-        //trun off timer
-        alarm(0);
-        if( connectionBroke == 0 ) ackRecv();
+        printf( "open error: %s", packet.msg );
+        makePacket( &packet, strlen(packet.msg), ERR, 0, 0, NULL );
+        Sendto( udp_servfd, &packet, packet.msgSize + PACKET_OVERHEAD, 0, (const SA*)&cliaddr, len );
+        goto NEW_CONNECTION;
+      }
+    }
 
-        if( recvPacket.type == ACK && connectionBroke == 0 ) {
-          //if acked
-          if( recvPacket.ack == seq ) {
-            //advance window
-            seq += bytesRead;
-            printf( "%d ACKed\n", recvPacket.ack );
-            //read next segment of data
-            fileSize -= bytesRead;
-            bytesRead = Readn( filefd, packet.msg, min( PMTU, fileSize ) );
-            //reset timeout interval for next packet
-            timeoutSecond = INITTIMEOUT;
-          //if lost ack
-          } else if( recvPacket.ack > seq ) {
-            //advance window
-            seq = recvPacket.ack;
-            printf( "%d ACKed\n", packet.ack );
-            //read next segment of data
-            fileSize -= bytesRead;
-            bytesRead = Readn( filefd, packet.msg, min( PMTU, fileSize ) );
-            //reset timeout interval for next packet
-            timeoutSecond = INITTIMEOUT;
+    //find out file size (just an extra reliable guarantee)
+    fileSize = lseek( filefd, -1, SEEK_END )+1;
+    printf( "reading %s, size %d bytes\n", recvPacket.msg, fileSize );
+    lseek( filefd, 0, SEEK_SET );
+    //initiating first packet
+    connectionBroke = 0;
+    seq = ack = 0;
+    bytesRead = Readn( filefd, packet.msg, min( PMTU, fileSize ) );
+    while( (fileSize>0) && (connectionBroke==0) ) {
+      makePacket( &packet, bytesRead, SYN, seq, 0, NULL );
+      //start timer
+      alarm(timeoutSecond);
+      Sendto( udp_servfd, &packet, packet.msgSize + PACKET_OVERHEAD, 0, (const SA*)&cliaddr, len );
+      debug_packet( &packet );
+
+      //timed recvfrom
+      while( recvfrom( udp_servfd, &recvPacket, sizeof(recvPacket), 0, (SA*)&cliaddr, &len ) < 0 ) {
+        //if timed out
+        if( errno == EINTR ) {
+          //double retransmission interval and retransmit if timeoutSecond < maxTimeout
+          if(timeoutSecond < MAXTIMEOUT) {
+            timeoutSecond <<= 1;
+            alarm(timeoutSecond);
+            Sendto( udp_servfd, &packet, packet.msgSize + PACKET_OVERHEAD, 0, (const SA*)&cliaddr, len );
+            printf( "packet retransmission, seq = %d\n", packet.seq );
+          //otherwise a broken connection is infered
+          } else {
+            //if connection timed out, send a last RST datagram then waits for other requests
+            connectionBroke = 1;
+            printf( "connection timed ouit\n" );
+            makePacket( &packet, 0, RST, 0, 0, NULL );
           }
+        } else
+          err_sys( "recvfromTimeout" );
+      }
+      //trun off timer
+      alarm(0);
+      if( connectionBroke == 0 ) debug_packet( &recvPacket );
+
+      if( recvPacket.type == ACK && connectionBroke == 0 ) {
+        //if acked
+        if( recvPacket.ack == seq ) {
+          //advance window
+          seq += bytesRead;
+          printf( "%d ACKed\n", recvPacket.ack );
+          //read next segment of data
+          fileSize -= bytesRead;
+          bytesRead = Readn( filefd, packet.msg, min( PMTU, fileSize ) );
+          //reset timeout interval for next packet
+          timeoutSecond = INITTIMEOUT;
+        //if lost ack
+        } else if( recvPacket.ack > seq ) {
+          //advance window
+          seq = recvPacket.ack;
+          printf( "%d ACKed\n", packet.ack );
+          //read next segment of data
+          fileSize -= bytesRead;
+          bytesRead = Readn( filefd, packet.msg, min( PMTU, fileSize ) );
+          //reset timeout interval for next packet
+          timeoutSecond = INITTIMEOUT;
         }
       }
-
-      //sending fin to signal comple file transfer
-      if( fileSize == 0 ) {
-        makePacket( &packet, 0, FIN, seq, ack, "\0" );
-        printf( "***file transfer succeed***\n" );
-        Sendto( udp_servfd, &packet, packet.msgSize + PACKET_OVERHEAD, 0, (const SA*)&cliaddr, len );
-        close( filefd );
-      }
+    }
+    //sending fin to signal comple file transfer
+    if( fileSize == 0 ) {
+      makePacket( &packet, 0, FIN, seq, ack, "\0" );
+      printf( "***file transfer succeed***\n" );
+      Sendto( udp_servfd, &packet, packet.msgSize + PACKET_OVERHEAD, 0, (const SA*)&cliaddr, len );
+      close( filefd );
     }
   }
   //restore sigalarm handler
   if( sigaction( SIGALRM, &oldsa, NULL ) == -1 )
     err_sys( "sigaction" );
   return 0;
-}
-
-static void timeoutSigalarmHandler( int sig )
-{
-  return;
 }
 

@@ -4,6 +4,7 @@
 #define SERV_PORT 9877
 #define BACKLOG 10
 #define FILENAMELEN 128
+#define WINDOW_SIZE 4096
 #define PMTU 1400 //it must be that sizeof(msg) > PMTU to garantee maximum performance
 #define MSS 1500
 #define ERR 1
@@ -11,6 +12,7 @@
 #define SYN 4
 #define FIN 8
 #define RST 16
+#define REQ 32
 #define INITTIMEOUT 1
 #define MAXTIMEOUT 32
 
@@ -34,4 +36,10 @@ readvTimeout(int fd, const struct iovec *iov, int iovcnt, int timeoutSecond);
 ssize_t
 recvfromTimeout( int fd, void* vptr, size_t len, int flags, SA* destAddr, socklen_t* paddrLen, int timeoutSecond );
 
+void
+timeoutSigalarmHandler( int sig );
+
+//debug utility
+void
+debug_packet( packet_t* p );
 #endif

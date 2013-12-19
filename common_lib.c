@@ -20,12 +20,6 @@ void makePacket( packet_t* ppacket, size_t msgSize, size_t type, size_t seq, siz
 	strncpy( ppacket->msg, msg, msgSize );
 }
 
-static void
-timeoutSigalarmHandler( int sig )
-{
-  return;
-}
-
 ssize_t readvTimeout(int fd, const struct iovec *iov, int iovcnt, int timeoutSecond)
 {
   struct sigaction sa, oldsa;
@@ -80,3 +74,22 @@ ssize_t recvfromTimeout( int fd, void* vptr, size_t len, int flags,
   
   return n;
 }
+
+void timeoutSigalarmHandler( int sig )
+{
+  return;
+}
+
+void
+debug_packet( packet_t* p )
+{
+  if( p->type == SYN )
+    printf( "packet sent: msgSize = %d, seq = %d\n", p->msgSize, p->seq );
+  else if( p->type == ACK )
+    printf( "ack received:              ack = %d\n", p->ack );
+  else if( p->type == FIN )
+    printf( "fin received\n" );
+  else
+	printf( "unrecognized type: %d\n", p->type );
+}
+

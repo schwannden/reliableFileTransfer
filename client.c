@@ -2,20 +2,8 @@
 #include "../nplib/np_lib.h"
 #include "common_lib.h"
 
-packet_t packet, recvPacket;
 void ftp_client( FILE* fpin, int clientfd, const SA* pservaddr, socklen_t servaddrLength );
-static void timeoutSigalarmHandler( int sig );
-
-void packetSent()
-{
-  printf( "packet sent: msgSize = %d, seq = %d\n", packet.msgSize, packet.seq );
-}
-
-void ackRecv()
-{
-  printf( "ack received: msgSize = %d, ack = %d\n", recvPacket.msgSize, recvPacket.ack );
-}
-
+packet_t packet, recvPacket;
 
 //main function
 int main( int argc, char** argv )
@@ -42,7 +30,6 @@ void ftp_client( FILE* fpin, int clientfd, const SA* pservaddr, socklen_t servad
   //data
   int n, outputfd, openFlags, seq, ack, timeoutSecond = INITTIMEOUT, connectionBroke;
   struct sigaction sa, oldsa;
-  char sendbuff[MAXLINE];
   struct iovec iov[2], riov[2];
   mode_t filePerms;
 
@@ -64,18 +51,18 @@ void ftp_client( FILE* fpin, int clientfd, const SA* pservaddr, socklen_t servad
   sa.sa_handler = timeoutSigalarmHandler;
   if( sigaction( SIGALRM, &sa, &oldsa ) == -1 )
     err_sys( "sigaction" );
-
   //there is only one peer, so connect
   Connect( clientfd, pservaddr, servaddrLength );
-
   //client keep requesting file
-  while( Fgets( sendbuff, sizeof(sendbuff), fpin ) != NULL ) {
-    //send request, a null terminated filename
+  while( Fgets( packet.msg, sizeof(packet.msg), fpin ) != NULL ) {
+	//initialize seq, ack, and connection status
     seq = ack = 0;
-    strtok( sendbuff, "\n" );
-    n = strlen(sendbuff);
     connectionBroke = 0;
-    write( clientfd, sendbuff, n+1 );
+    //send request, a null terminated filename
+    strtok( packet.msg, "\n" );
+	n = strlen( packet.msg )+1;
+	makePacket( &packet, n, REQ, seq, ack, NULL );
+    write( clientfd, &packet, n+PACKET_OVERHEAD );
 
     //wait for first data packet
     alarm( timeoutSecond );
@@ -86,24 +73,24 @@ void ftp_client( FILE* fpin, int clientfd, const SA* pservaddr, socklen_t servad
         if(timeoutSecond < MAXTIMEOUT) {
           timeoutSecond <<= 1;
           alarm(timeoutSecond);
-          write( clientfd, sendbuff, n+1 );
+          write( clientfd, packet.msg, strlen(packet.msg)+1 );
           printf( "request retransmission\n" );
         //otherwise a broken connection is infered, note a broken connection is a fatal error in client
         } else err_sys( "connection timed out" );
       } else
-        err_sys( "recvfromTimeout" );
+        err_sys( "readvTimeout" );
     }
     alarm(0);
 
     //if server can't open file
     if( recvPacket.type == ERR ) {
-        write( STDOUT_FILENO, packet.msg, packet.msgSize );
+        write( STDOUT_FILENO, recvPacket.msg, recvPacket.msgSize );
     //if file can be tranmited
     } else if(recvPacket.type == SYN){
       //open output file
-      strcpy( sendbuff+n, "_cp" );
-      if( (outputfd = open( sendbuff, openFlags, filePerms)) == -1 )
-        err_sys("open file %s", sendbuff);
+      strcpy( packet.msg+strlen(packet.msg), "_cp" );
+      if( (outputfd = open( packet.msg, openFlags, filePerms)) == -1 )
+        err_sys("open file %s", packet.msg);
      
       //start receiving file
       while( recvPacket.type != FIN ) {
@@ -146,8 +133,3 @@ void ftp_client( FILE* fpin, int clientfd, const SA* pservaddr, socklen_t servad
     err_sys( "sigaction" );
 }
 
-
-static void timeoutSigalarmHandler( int sig )
-{
-  return;
-}
