@@ -1,14 +1,7 @@
 #include "../nplib/np_header.h"
 #include "../nplib/np_lib.h"
+#include "../nplib/error_functions.h"
 #include "common_lib.h"
-
-#define TIMEOUT_SIG 1;
-#define TIMEOUT_ACCEPT 2;
-#define TIMEOUT_SOCKOPT 3;
-
-#ifndef TIMEOUT_METHOD
-#define TIMEOUT_METHOD TIMEOUT_SIG
-#endif
 
 void makePacket( packet_t* ppacket, size_t msgSize, size_t type, size_t seq, size_t ack, const char* msg )
 {
@@ -17,71 +10,15 @@ void makePacket( packet_t* ppacket, size_t msgSize, size_t type, size_t seq, siz
   ppacket->seq = seq;
   ppacket->ack = ack;
   if( msg != NULL )
-	strncpy( ppacket->msg, msg, msgSize );
+    strncpy( ppacket->msg, msg, msgSize );
 }
 
-ssize_t readvTimeout(int fd, const struct iovec *iov, int iovcnt, int timeoutSecond)
+void sigalarmHandler( int sig )
 {
-  struct sigaction sa, oldsa;
-  int n;
-
-  //set handler for SIGALRM
-  sigaction( SIGALRM, NULL, &sa );
-  sigemptyset( &sa.sa_mask );
-  sa.sa_flags &= ~SA_RESTART;
-  sa.sa_handler = timeoutSigalarmHandler;
-  if( sigaction( SIGALRM, &sa, &oldsa ) == -1 )
-    err_sys( "sigaction" );
-
-  alarm( timeoutSecond );
-  if( (n = readv( fd, iov, iovcnt )) < 0 ) {
-    if( errno == EINTR ) {
-	  errno = ETIMEDOUT;
-      fprintf( stderr, "readv timed out\n" );
-	}
-  }
-  alarm(0);
-  if( sigaction( SIGALRM, &oldsa, NULL ) == -1 )
-    err_sys( "sigaction" );
-  
-  return n;
-}
-
-ssize_t recvfromTimeout( int fd, void* vptr, size_t len, int flags,
-                         SA* destAddr, socklen_t* paddrLen, int timeoutSecond )
-{
-  struct sigaction sa, oldsa;
-  int n;
-
-  //set handler for SIGALRM
-  sigaction( SIGALRM, NULL, &sa );
-  sigemptyset( &sa.sa_mask );
-  sa.sa_flags &= ~SA_RESTART;
-  sa.sa_handler = timeoutSigalarmHandler;
-  if( sigaction( SIGALRM, &sa, &oldsa ) == -1 )
-    err_sys( "sigaction" );
-
-  alarm( timeoutSecond );
-  if( (n = recvfrom( fd, vptr, len, flags, destAddr, paddrLen )) < 0 ) {
-    if( errno == EINTR ) {
-	  errno = ETIMEDOUT;
-      fprintf( stderr, "recvfrom timed out\n" );
-	}
-  }
-  alarm(0);
-  if( sigaction( SIGALRM, &oldsa, NULL ) == -1 )
-    err_sys( "sigaction" );
-  
-  return n;
-}
-
-void timeoutSigalarmHandler( int sig )
-{
+  //timedout = 1;
   return;
 }
-
-void
-debug_packet( packet_t* p )
+void debug_packet( packet_t* p )
 {
   if( p->type == SYN )
     printf( "packet sent: msgSize = %d, seq = %d\n", p->msgSize, p->seq );
@@ -90,6 +27,89 @@ debug_packet( packet_t* p )
   else if( p->type == FIN )
     printf( "fin received\n" );
   else
-	printf( "unrecognized type: %d\n", p->type );
+    printf( "unrecognized type: %d\n", p->type );
 }
 
+void advanceWindow( int* p )
+{
+  *p = (((*p)+1)%WINDOW_SIZE);
+}
+
+seqnum_t seqtoi( seqnum_t n )
+{
+  return (n/RMSS)%WINDOW_SIZE;
+}
+
+int inorder( seqnum_t x, seqnum_t y, seqnum_t z )
+{
+  return (x <= y && y <= z)||(z <= x && x <= y)||(y <= z && z <= x);
+}
+
+static int timedout;
+
+void makeTimer()
+{
+  struct sigaction sa;
+  sigset_t blockset;
+  sigemptyset( &blockset );
+  sigemptyset( &sa.sa_mask );
+  sa.sa_flags = SA_RESTART;
+  sa.sa_handler = sigalarmHandler;
+  if( sigaction( SIGALRM, &sa, NULL ) < 0 )
+    err_sys( "sigaction error" );
+}
+
+void startTimer()
+{
+  timedout = 0;
+  //block SIGALARM
+  sigset_t blockset;
+  sigemptyset( &blockset );
+  sigaddset( &blockset, SIGALRM );
+  if( sigprocmask( SIG_BLOCK, &blockset, NULL ) < 0 )
+    err_sys( "sigprocmask error" );
+  //start SIGALARM timer
+  alarm(INITTIMEOUT);
+}
+
+void stopTimer()
+{
+  alarm(0);
+}
+
+int checkTimer()
+{
+  int timedout;
+  sigset_t sigset;
+  sigemptyset( &sigset );
+  if( sigpending(&sigset) < 0 )
+    err_sys( "sigpending error" );
+  timedout = sigismember( &sigset, SIGALRM );
+  //if timed out, unblock mask to flush signal
+  if( timedout ) {
+    sigaddset( &sigset, SIGALRM );
+    if( sigprocmask( SIG_UNBLOCK, &sigset, NULL ) < 0 )
+      err_sys( "sigprocmask error" );
+  }
+  return timedout;
+}
+
+/*
+
+void startTimer()
+{
+  timedout = 0;
+  alarm(INITTIMEOUT);
+}
+
+void stopTimer()
+{
+  alarm(0);
+  timedout = 0;
+}
+
+int checkTimer()
+{
+  return timedout;
+}
+*/

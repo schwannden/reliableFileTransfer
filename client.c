@@ -2,8 +2,17 @@
 #include "../nplib/np_lib.h"
 #include "common_lib.h"
 
-void ftp_client( FILE* fpin, int clientfd, const SA* pservaddr, socklen_t servaddrLength );
-packet_t packet, recvPacket;
+/*               notation on my usage of variables
+
+int                      lw
+ +------+------+------+------+------+------+------+------+------+....
+ |wrote |wrote | wrote|      |      | recv |      | recv |      |....
+ +------+------+------+------+------+------+------+------+------+....
+                       ^
+seqnum_t           seqExpected                                     */
+
+packet_t packet, recvPacket[WINDOW_SIZE];
+void ftp_client( FILE* fpin, int clientfd );
 
 //main function
 int main( int argc, char** argv )
@@ -11,121 +20,86 @@ int main( int argc, char** argv )
   int clientfd;
   struct sockaddr_in servaddr;
 
-  if(argc != 2)    err_quit( "usage: client <IPaddress>\n" );
+  if(argc != 2)
+    err_quit( "usage: client <IPaddress>\n" );
 
   bzero( &servaddr, sizeof(servaddr) );
   servaddr.sin_family = AF_INET;
   servaddr.sin_port = htons(SERV_PORT);
   Inet_pton( AF_INET, argv[1], &servaddr.sin_addr );
-
   clientfd = Socket( AF_INET, SOCK_DGRAM, 0 );
+  //there is only one peer, so connect
+  Connect( clientfd, (const SA*)&servaddr, sizeof(servaddr));
 
-  ftp_client( stdin, clientfd, (const SA*)&servaddr, sizeof(servaddr) );
+  ftp_client( stdin, clientfd );
 
   return 0;
 }
 
-void ftp_client( FILE* fpin, int clientfd, const SA* pservaddr, socklen_t servaddrLength )
+void ftp_client( FILE* fpin, int clientfd )
 {
   //data
-  int n, outputfd, openFlags, seq, ack, timeoutSecond = INITTIMEOUT, connectionBroke;
+  int i, n, filefd, openFlags, second, lw;
+  seqnum_t seqExpected;
   struct sigaction sa, oldsa;
-  struct iovec iov[2], riov[2];
+  int received[WINDOW_SIZE];
   mode_t filePerms;
-
-  openFlags = O_CREAT | O_WRONLY | O_TRUNC;
+  //initializing data
   filePerms = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH; //rw-rw-rw-
-  iov[0].iov_base = &packet;
-  iov[0].iov_len = PACKET_OVERHEAD;
-  iov[1].iov_base = packet.msg;
-  iov[1].iov_len = sizeof(packet.msg);
-  riov[0].iov_base = &recvPacket;
-  riov[0].iov_len = PACKET_OVERHEAD;
-  riov[1].iov_base = recvPacket.msg;
-  riov[1].iov_len = sizeof(recvPacket.msg);
-
+  openFlags = O_CREAT | O_WRONLY | O_TRUNC;
   //set handler for SIGALRM
   sigaction( SIGALRM, NULL, &sa );
   sigemptyset( &sa.sa_mask );
   sa.sa_flags &= ~SA_RESTART;
-  sa.sa_handler = timeoutSigalarmHandler;
+  sa.sa_handler = sigalarmHandler;
   if( sigaction( SIGALRM, &sa, &oldsa ) == -1 )
     err_sys( "sigaction" );
-  //there is only one peer, so connect
-  Connect( clientfd, pservaddr, servaddrLength );
+
   //client keep requesting file
   while( Fgets( packet.msg, sizeof(packet.msg), fpin ) != NULL ) {
-	//initialize seq, ack, and connection status
-    seq = ack = 0;
-    connectionBroke = 0;
+    //initialize data for each new request
+    second = INITTIMEOUT;
+    seqExpected = lw = 0;
+    for( i = 0 ; i < WINDOW_SIZE ; i++) received[i] = 0;
     //send request, a null terminated filename
     strtok( packet.msg, "\n" );
-	n = strlen( packet.msg )+1;
-	makePacket( &packet, n, REQ, seq, ack, NULL );
-    write( clientfd, &packet, n+PACKET_OVERHEAD );
+    makePacket( &packet, strlen( packet.msg )+1, REQ, 0, 0, NULL );
+    write( clientfd, &packet, packet.msgSize+PACKET_OVERHEAD );
 
-    //wait for first data packet
-    alarm( timeoutSecond );
-    while( readv( clientfd, riov, 2 ) < 0 ) {
-      //if timed out
-      if( errno == EINTR ) {
-        //double retransmission interval and retransmit if timeoutSecond < MAXTIMEOUT
-        if(timeoutSecond < MAXTIMEOUT) {
-          timeoutSecond <<= 1;
-          alarm(timeoutSecond);
-          write( clientfd, packet.msg, strlen(packet.msg)+1 );
-          printf( "request retransmission\n" );
-        //otherwise a broken connection is infered, note a broken connection is a fatal error in client
-        } else err_sys( "connection timed out" );
-      } else
-        err_sys( "readvTimeout" );
-    }
-    alarm(0);
-
-    //if server can't open file
-    if( recvPacket.type == ERR ) {
-        write( STDOUT_FILENO, recvPacket.msg, recvPacket.msgSize );
-    //if file can be tranmited
-    } else if(recvPacket.type == SYN){
+    //read first packet from server, and decide whether a connection will be open
+    read( clientfd, &recvPacket[lw], RMSS+PACKET_OVERHEAD );
+    //if server can't open file, connection end
+    if( recvPacket[lw].type == ERR ) {
+        write( STDOUT_FILENO, recvPacket[0].msg, recvPacket[0].msgSize );
+    //otherwise connection begin
+    } else {
       //open output file
       strcpy( packet.msg+strlen(packet.msg), "_cp" );
-      if( (outputfd = open( packet.msg, openFlags, filePerms)) == -1 )
+      if( (filefd = open( packet.msg, openFlags, filePerms)) == -1 )
         err_sys("open file %s", packet.msg);
-     
       //start receiving file
-      while( recvPacket.type != FIN ) {
-        if( recvPacket.type == SYN ){
-          //if acked
-          if( recvPacket.seq == ack ){
-            timeoutSecond = INITTIMEOUT;
-            printf( "packet received, seq = %d, msgSize = %d\n", recvPacket.seq, recvPacket.msgSize );
-            write( outputfd, recvPacket.msg, recvPacket.msgSize );
-            makePacket( &packet, 0, ACK, 0, ack, NULL );
-            ack += recvPacket.msgSize;
+      while( recvPacket[lw].type != FIN ) {
+        makePacket( &packet, 0, ACK, 0, recvPacket[lw].seq+recvPacket[lw].msgSize, NULL );
+        write( clientfd, &packet, PACKET_OVERHEAD );
+        received[lw] = 1;
+        if( recvPacket[lw].seq == seqExpected ){
+          while( received[lw] == 1 ){
+            received[lw] = 0;
+            seqExpected += recvPacket[lw].msgSize;
+            write( filefd, recvPacket[lw].msg, recvPacket[lw].msgSize );
+            advanceWindow( &lw );
+          }
+        } else if( recvPacket[lw].seq > seqExpected ){
+          received[lw] = 0;
+          i = seqtoi( recvPacket[lw].seq );
+          if( received[i] == 0 ){
+            memcpy( &recvPacket[i], &recvPacket[lw], recvPacket[lw].msgSize + PACKET_OVERHEAD );
+            received[i] = 1;
           }
         }
-
-        write( clientfd, &packet, PACKET_OVERHEAD );
-        alarm(timeoutSecond);
-        //timed readv
-        while( readv( clientfd, riov, 2 ) < 0 ) {
-          //if timed out
-          if( errno == EINTR ) {
-            //double retransmission interval and retransmit if timeoutSecond < MAXTIMEOUT
-            if(timeoutSecond < MAXTIMEOUT) {
-              timeoutSecond <<= 1;
-              alarm(timeoutSecond);
-              write( clientfd, &packet, PACKET_OVERHEAD );
-              printf( "ack retransmission, packet.ack = %d\n", packet.ack );
-            //otherwise a broken connection is infered, note a broken connection is a fatal error in client
-            } else err_sys( "connection timed out" );
-          } else
-            err_sys( "recvfromTimeout" );
-        }
-        alarm(0);
+        read( clientfd, &recvPacket[lw], RMSS+PACKET_OVERHEAD );
       }
-      printf( "\n*** File transfer conplete ***\n" );
-      close(outputfd);
+	  close( filefd );
     }
   }
   //restore sigalarm handler
