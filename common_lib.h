@@ -4,7 +4,7 @@
 #define SERV_PORT 9877
 #define BACKLOG 10
 #define FILENAMELEN 128
-#define WINDOW_SIZE 128
+#define WINDOW_SIZE 64
 #define PMTU 1400 //it must be that sizeof(msg) > PMTU to garantee maximum performance
 #define MSS 1500
 #define RMSS (min( PMTU, MSS ))

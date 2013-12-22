@@ -20,23 +20,20 @@ int packetOutstanding( int l, int u );
 int main( int argc, char** argv )
 {
   //data
-  //ackExpected=lower window(the ack expecting to appear, which is the lowest un-acked packet's seq + its size)
-  //seq=next-byte-to-send
-  //uw=upper window, which is also the next byte to read from file
   int i, n, udp_servfd, bytesRead, len, filefd, fileSize, lw, uw, ready,
-      timeoutSecond, connectionBroke, maxfd, fileeof;
+      connectionBroke, maxfd, fileeof;
   struct sockaddr_in udp_servaddr, tcp_servaddr, cliaddr;
   seqnum_t seq, ackExpected, nextByteToRead;
+  struct timeval timeoutValue;
   int acked[WINDOW_SIZE];
   fd_set rset, wset;
+  //initialize data
   FD_ZERO( &rset );
   FD_ZERO( &wset );
-  //initialize data
   connectionBroke = 1;
-  timeoutSecond = INITTIMEOUT;
-  makeTimer();
+  timeoutValue.tv_sec = 0;
+  timeoutValue.tv_usec = 20;
   for( i = 0 ; i < WINDOW_SIZE ; i++ ) acked[i] = 0;
-  //RMSS is the real MSS under PMTU and MSS constraints
   //UDP socket create and bind
   udp_servfd = Socket( AF_INET, SOCK_DGRAM, 0 );
   bzero( &udp_servaddr, sizeof(udp_servaddr) );
@@ -47,11 +44,13 @@ int main( int argc, char** argv )
 
   while( 1 ){
     //if state == no-connection, block waiting for request
-    if(connectionBroke == 1){ 
+    if(connectionBroke == 1){
+      //set to blocking IO
       i = Fcntl( udp_servfd, F_GETFL, 0 );
       Fcntl( udp_servfd, F_SETFL, i & ~O_NONBLOCK );
       bzero( &cliaddr, sizeof(cliaddr) );
       len = sizeof(cliaddr);
+	  //if connection fail
       if( (filefd = receiveREQ( udp_servfd, &cliaddr, &len )) < 0 ) {
         switch( errno ){
           case EMEDIUMTYPE: printf( "unrecognized packet received\n" ); break;
@@ -65,6 +64,7 @@ int main( int argc, char** argv )
           Sendto( udp_servfd, &packet[0], packet[0].msgSize + PACKET_OVERHEAD, 0, (const SA*)&cliaddr, len );
         }
       } else {
+	    //if connection succeed
         //find out file size (just an extra reliable guarantee)
         fileSize = lseek( filefd, -1, SEEK_END )+1;
         printf( "reading %s, size %d bytes\n", recvPacket.msg, fileSize );
@@ -72,22 +72,29 @@ int main( int argc, char** argv )
         //initiating first packet
         connectionBroke = fileeof = lw = uw = ready = 0;
         ackExpected = seq = nextByteToRead = 0;
-        startTimer();
+        //switch to nonblocking IO
+        i = Fcntl( udp_servfd, F_GETFL, 0 );
+        Fcntl( udp_servfd, F_SETFL, i | O_NONBLOCK );
       }
     } else{
-    //prepare for select
-    i = Fcntl( udp_servfd, F_GETFL, 0 );
-    Fcntl( udp_servfd, F_SETFL, i | O_NONBLOCK );
-    if(fileeof == 0 && remain(ready, lw) )
-      FD_SET( filefd, &rset );
-    FD_SET( udp_servfd, &rset );
-    if( packetOutstanding( uw, ready ) )
-      FD_SET( udp_servfd, &wset );
-    maxfd = max(udp_servfd, filefd) + 1;
-    select( maxfd, &rset, &wset, NULL, NULL );
-
-//event: file ready for read and there is space in buffer
+      //preparing for select
+      if(fileeof == 0 && remain(ready, lw) )
+        FD_SET( filefd, &rset );
+      FD_SET( udp_servfd, &rset );
+      if( packetOutstanding( uw, ready ) )
+        FD_SET( udp_servfd, &wset );
+      maxfd = max(udp_servfd, filefd) + 1;
+      if( (n = select( maxfd, &rset, NULL, NULL, &timeoutValue )) == 0 ){
+        //if select timed out
+        //printf( "timer expired~~~~\n" );
+        for( i = lw ; i != uw ; advanceWindow(&i) ){
+          if( acked[i] == 0 )
+            //printf( "slot %d, seq = %d retransmitted\n", i, packet[i].seq );
+            sendto( udp_servfd, &packet[i], packet[i].msgSize + PACKET_OVERHEAD, 0, (const SA*)&cliaddr, len );
+        }
+      }
       if( FD_ISSET(filefd, &rset) ) {
+//event: file ready for read and there is space in buffer
         //printf( "event: file ready for read\n" );
         while( fileSize > 0 && remain(ready, lw) ) {
           acked[ready] = 0;
@@ -100,35 +107,23 @@ int main( int argc, char** argv )
         }
         if( fileSize == 0 ) {
           fileeof = 1;
-          FD_CLR( filefd, &rset );
         }
+        FD_CLR( filefd, &rset );
         FD_SET( udp_servfd, &wset );
       }
 //event: sending packet
-      if( FD_ISSET(udp_servfd, &wset) ) {
-        //printf( "event: udp_servfd ready for write\n" );
-        while( packetOutstanding( uw, ready ) ){
-          if( sendto( udp_servfd, &packet[uw], packet[uw].msgSize + PACKET_OVERHEAD, 0, (const SA*)&cliaddr, len ) > 0 ){
-            //printf( "slot %d, ", uw );
-            //debug_packet( &packet[uw] );
-            seq += packet[uw].msgSize;
-            advanceWindow( &uw );
-          } else
-            if( errno != EWOULDBLOCK )
-              err_sys( "sendto error on udp_servfd" );
-        }
-        if( checkTimer() ){
-          //printf( "timer expired~~~~\n" );
-          for( i = lw ; i != uw ; advanceWindow(&i) ){
-            if( acked[i] == 0 )
-              //printf( "slot %d, seq = %d retransmitted\n", i, packet[i].seq );
-              sendto( udp_servfd, &packet[i], packet[i].msgSize + PACKET_OVERHEAD, 0, (const SA*)&cliaddr, len );
-          }
-          startTimer();
-        }
+      while( packetOutstanding( uw, ready ) ){
+        if( sendto( udp_servfd, &packet[uw], packet[uw].msgSize + PACKET_OVERHEAD, 0, (const SA*)&cliaddr, len ) > 0 ){
+          //printf( "slot %d, ", uw );
+          //debug_packet( &packet[uw] );
+          seq += packet[uw].msgSize;
+          advanceWindow( &uw );
+        } else
+          if( errno != EWOULDBLOCK )
+            err_sys( "sendto error on udp_servfd" );
       }
-//event: ack received
       if( FD_ISSET(udp_servfd, &rset) ) {
+//event: ack received
         //printf( "event: udp_servfd ready for read\n" );
         while( recvfrom( udp_servfd, &recvPacket, sizeof(recvPacket), 0, (SA*)&cliaddr, &len ) > 0 ) {
           //debug_packet( &recvPacket );
@@ -157,10 +152,10 @@ int main( int argc, char** argv )
           makePacket( &packet[lw], 0, FIN, seq, 0, NULL );
           printf( "***file transfer succeed***\n" );
           Sendto( udp_servfd, &packet[lw], PACKET_OVERHEAD, 0, (const SA*)&cliaddr, len );
+          Sendto( udp_servfd, &packet[lw], PACKET_OVERHEAD, 0, (const SA*)&cliaddr, len );
+          Sendto( udp_servfd, &packet[lw], PACKET_OVERHEAD, 0, (const SA*)&cliaddr, len );
           close( filefd );
           connectionBroke = 1;
-          checkTimer();
-          stopTimer();
         }
       }
     }    

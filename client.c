@@ -68,17 +68,18 @@ void ftp_client( FILE* fpin, int clientfd )
 
     //read first packet from server, and decide whether a connection will be open
     read( clientfd, &recvPacket[lw], RMSS+PACKET_OVERHEAD );
-    //if server can't open file, connection end
     if( recvPacket[lw].type == ERR ) {
-        write( STDOUT_FILENO, recvPacket[0].msg, recvPacket[0].msgSize );
-    //otherwise connection begin
+      //if server can't open file, connection end
+      write( STDOUT_FILENO, recvPacket[0].msg, recvPacket[0].msgSize );
     } else {
+      //otherwise connection begin
       //open output file
       strcpy( packet.msg+strlen(packet.msg), "_cp" );
       if( (filefd = open( packet.msg, openFlags, filePerms)) == -1 )
         err_sys("open file %s", packet.msg);
       //start receiving file
       while( recvPacket[lw].type != FIN ) {
+	    //printf( "packet received: seq = %d\n", recvPacket[lw].seq );
         makePacket( &packet, 0, ACK, 0, recvPacket[lw].seq+recvPacket[lw].msgSize, NULL );
         write( clientfd, &packet, PACKET_OVERHEAD );
         received[lw] = 1;
@@ -99,7 +100,8 @@ void ftp_client( FILE* fpin, int clientfd )
         }
         read( clientfd, &recvPacket[lw], RMSS+PACKET_OVERHEAD );
       }
-	  close( filefd );
+      printf( "***file transfer succeed***\n" );
+      close( filefd );
     }
   }
   //restore sigalarm handler
