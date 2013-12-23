@@ -40,17 +40,15 @@ int main( int argc, char** argv )
   udp_servaddr.sin_family = AF_INET;
   udp_servaddr.sin_port = htons(SERV_PORT);
   udp_servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+  Setsockopt( udp_servfd, SOL_SOCKET, SO_RCVTIMEO, &timeoutValue, sizeof(timeoutValue) );
   Bind( udp_servfd, (SA*)&udp_servaddr, sizeof(udp_servaddr) );
 
   while( 1 ){
     //if state == no-connection, block waiting for request
     if(connectionBroke == 1){
-      //set to blocking IO
-      i = Fcntl( udp_servfd, F_GETFL, 0 );
-      Fcntl( udp_servfd, F_SETFL, i & ~O_NONBLOCK );
       bzero( &cliaddr, sizeof(cliaddr) );
       len = sizeof(cliaddr);
-	  //if connection fail
+      //if connection fail
       if( (filefd = receiveREQ( udp_servfd, &cliaddr, &len )) < 0 ) {
         switch( errno ){
           case EMEDIUMTYPE: printf( "unrecognized packet received\n" ); break;
@@ -64,7 +62,7 @@ int main( int argc, char** argv )
           Sendto( udp_servfd, &packet[0], packet[0].msgSize + PACKET_OVERHEAD, 0, (const SA*)&cliaddr, len );
         }
       } else {
-	    //if connection succeed
+        //if connection succeed
         //find out file size (just an extra reliable guarantee)
         fileSize = lseek( filefd, -1, SEEK_END )+1;
         printf( "reading %s, size %d bytes\n", recvPacket.msg, fileSize );
@@ -72,9 +70,6 @@ int main( int argc, char** argv )
         //initiating first packet
         connectionBroke = fileeof = lw = uw = ready = 0;
         ackExpected = seq = nextByteToRead = 0;
-        //switch to nonblocking IO
-        i = Fcntl( udp_servfd, F_GETFL, 0 );
-        Fcntl( udp_servfd, F_SETFL, i | O_NONBLOCK );
       }
     } else{
       //preparing for select
@@ -84,7 +79,7 @@ int main( int argc, char** argv )
       if( packetOutstanding( uw, ready ) )
         FD_SET( udp_servfd, &wset );
       maxfd = max(udp_servfd, filefd) + 1;
-      if( (n = select( maxfd, &rset, NULL, NULL, &timeoutValue )) == 0 ){
+      if( select( maxfd, &rset, NULL, NULL, &timeoutValue ) == 0 ){
         //if select timed out
         //printf( "timer expired~~~~\n" );
         for( i = lw ; i != uw ; advanceWindow(&i) ){
@@ -148,6 +143,12 @@ int main( int argc, char** argv )
           }
         }
         if( errno != EWOULDBLOCK ) err_sys( "recvfrom error on udp_servfd" );
+        else{
+          for( i = lw ; i != uw ; advanceWindow(&i) ){
+            if( acked[i] == 0 )
+              sendto( udp_servfd, &packet[i], packet[i].msgSize + PACKET_OVERHEAD, 0, (const SA*)&cliaddr, len );
+          }
+        }
         if( fileeof == 1 && lw == uw ) {
           makePacket( &packet[lw], 0, FIN, seq, 0, NULL );
           printf( "***file transfer succeed***\n" );
@@ -168,7 +169,10 @@ int receiveREQ( int servfd, struct sockaddr_in* pcliaddr, socklen_t* plen )
   char clientIP[INET_ADDRSTRLEN];
   printf( "waiting for request...\n" );
   //receiving a null terminated filename
-  recvfrom( servfd, &recvPacket, sizeof(recvPacket), 0, (SA*)pcliaddr, plen  );
+again:
+  if( recvfrom( servfd, &recvPacket, sizeof(recvPacket), 0, (SA*)pcliaddr, plen  ) < 0 )
+    if(errno == EWOULDBLOCK) goto again;
+    else err_sys( "recvfrom for REQ error" );
   if( recvPacket.type != REQ ) {
     errno = EMEDIUMTYPE;
     return -1;
